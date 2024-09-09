@@ -8,6 +8,7 @@ const userRoutes = require('../src/routes/auth');
 const documentRoutes = require('./routes/documents');
 const Document = require('./model/Document');
 const jwt = require('jsonwebtoken');
+const Redis = require('ioredis');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,6 +17,27 @@ const io = socketIo(server, {
     origin: "http://localhost:3000",
     methods: ["GET", "POST"]
   }
+});
+
+// Redis configuration
+const redisConfig = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: process.env.REDIS_PORT || 6379,
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  }
+};
+
+// Initialize Redis client
+const redis = new Redis(redisConfig);
+
+redis.on('error', (error) => {
+  console.error('Redis connection error:', error);
+});
+
+redis.on('connect', () => {
+  console.log('Successfully connected to Redis');
 });
 
 connectDB();
@@ -45,7 +67,7 @@ io.on('connection', (socket) => {
     const document = await Document.findById(documentId).populate('owner', 'username');
     if (document) {
       socket.emit('document-update', document);
-      
+
       if (!activeUsers.has(documentId)) {
         activeUsers.set(documentId, new Set());
       }
@@ -77,9 +99,31 @@ io.on('connection', (socket) => {
 
   socket.on('update-document', async ({ documentId, content }) => {
     try {
-      const document = await Document.findByIdAndUpdate(documentId, { content }, { new: true })
-        .populate('owner', 'username');
-      io.to(documentId).emit('document-update', document);
+      // Store the content in Redis cache
+      await redis.set(`doc:${documentId}`, JSON.stringify({ content, timestamp: Date.now() }));
+
+      // Emit the update to all clients immediately
+      io.to(documentId).emit('document-update', { _id: documentId, content });
+
+      // Schedule the MongoDB update after 5 seconds
+      setTimeout(async () => {
+        try {
+          // Get the latest version from Redis
+          const cachedDoc = await redis.get(`doc:${documentId}`);
+          if (cachedDoc) {
+            const { content: latestContent } = JSON.parse(cachedDoc);
+            
+            // Update MongoDB
+            const document = await Document.findByIdAndUpdate(documentId, { content: latestContent }, { new: true })
+              .populate('owner', 'username');
+            
+            // Emit the update again (in case there were any changes during the 5-second window)
+            io.to(documentId).emit('document-update', document);
+          }
+        } catch (error) {
+          console.error('Error updating document in MongoDB:', error);
+        }
+      }, 10000);
     } catch (error) {
       console.error('Error updating document:', error);
     }
